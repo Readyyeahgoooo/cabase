@@ -10,59 +10,91 @@ export async function POST(request: NextRequest) {
     const startTime = Date.now()
 
     try {
-        const { query } = await request.json()
+        const { query, court } = await request.json()
 
         if (!query || typeof query !== 'string') {
             return NextResponse.json({ error: 'Query is required' }, { status: 400 })
         }
 
         // Step 1: Generate embedding for the query using iFlow
-        const embeddingResponse = await fetch(`${IFLOW_API_URL}/embeddings`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${IFLOW_API_KEY}`,
-            },
-            body: JSON.stringify({
-                model: 'text-embedding-3-small',
-                input: query,
-            }),
-        })
+        let queryEmbedding: number[] | null = null
 
-        if (!embeddingResponse.ok) {
-            // Fallback: Use a simple keyword search if embedding fails
-            console.error('Embedding API failed, falling back to keyword search')
-            return await keywordSearch(query, startTime)
+        try {
+            const embeddingResponse = await fetch(`${IFLOW_API_URL}/embeddings`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${IFLOW_API_KEY}`,
+                },
+                body: JSON.stringify({
+                    model: 'text-embedding-3-small',
+                    input: query,
+                }),
+            })
+
+            if (embeddingResponse.ok) {
+                const embeddingData = await embeddingResponse.json()
+                queryEmbedding = embeddingData.data?.[0]?.embedding
+            }
+        } catch (e) {
+            console.error('Embedding API error:', e)
         }
 
-        const embeddingData = await embeddingResponse.json()
-        const queryEmbedding = embeddingData.data[0].embedding
+        let results: any[] = []
 
-        // Step 2: Search Supabase for similar chunks
-        const searchResponse = await fetch(`${SUPABASE_URL}/rest/v1/rpc/match_legal_chunks`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'apikey': SUPABASE_KEY,
-                'Authorization': `Bearer ${SUPABASE_KEY}`,
-            },
-            body: JSON.stringify({
+        if (queryEmbedding) {
+            // Step 2a: Use semantic search with embeddings
+            const searchBody: any = {
                 query_embedding: queryEmbedding,
-                match_threshold: 0.4,
-                match_count: 8,
-            }),
-        })
+                match_threshold: 0.35,
+                match_count: 10,
+            }
 
-        if (!searchResponse.ok) {
-            const errorText = await searchResponse.text()
-            console.error('Supabase search failed:', errorText)
-            return NextResponse.json({ error: 'Search failed' }, { status: 500 })
+            if (court && court !== 'all') {
+                searchBody.filter_court = court
+            }
+
+            const searchResponse = await fetch(`${SUPABASE_URL}/rest/v1/rpc/match_legal_chunks`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'apikey': SUPABASE_KEY,
+                    'Authorization': `Bearer ${SUPABASE_KEY}`,
+                },
+                body: JSON.stringify(searchBody),
+            })
+
+            if (searchResponse.ok) {
+                results = await searchResponse.json()
+            }
         }
 
-        const results = await searchResponse.json()
+        // Step 2b: Fallback to keyword search if embedding failed or no results
+        if (results.length === 0) {
+            const keywords = query.split(' ').filter((w: string) => w.length > 3).slice(0, 3)
+            const searchTerms = keywords.map((k: string) => `chunk_text.ilike.*${k}*`).join(',')
 
-        // Step 3: Generate AI answer with citations
-        let aiAnswer = null
+            let url = `${SUPABASE_URL}/rest/v1/case_chunks?or=(${searchTerms})&limit=10&select=id,case_id,case_name,neutral_citation,court,decision_date,chunk_text,section_type,hklii_id`
+
+            if (court && court !== 'all') {
+                url += `&court=eq.${court}`
+            }
+
+            const fallbackResponse = await fetch(url, {
+                headers: {
+                    'apikey': SUPABASE_KEY,
+                    'Authorization': `Bearer ${SUPABASE_KEY}`,
+                },
+            })
+
+            if (fallbackResponse.ok) {
+                const fallbackResults = await fallbackResponse.json()
+                results = fallbackResults.map((r: any) => ({ ...r, similarity: 0.5 }))
+            }
+        }
+
+        // Step 3: Generate AI answer with citations (if we have results)
+        let aiAnswer: string | null = null
         if (results.length > 0) {
             aiAnswer = await generateAIAnswer(query, results)
         }
@@ -77,58 +109,44 @@ export async function POST(request: NextRequest) {
         })
     } catch (error) {
         console.error('Search error:', error)
-        return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+        return NextResponse.json({
+            error: 'Search failed. Please try again.',
+            details: error instanceof Error ? error.message : 'Unknown error'
+        }, { status: 500 })
     }
 }
 
-async function keywordSearch(query: string, startTime: number) {
-    // Fallback keyword search using Supabase full-text search
-    const searchResponse = await fetch(
-        `${SUPABASE_URL}/rest/v1/case_chunks?chunk_text=ilike.*${encodeURIComponent(query.split(' ')[0])}*&limit=5`,
-        {
-            headers: {
-                'apikey': SUPABASE_KEY,
-                'Authorization': `Bearer ${SUPABASE_KEY}`,
-            },
-        }
-    )
-
-    const results = await searchResponse.json()
-    const timeTaken = (Date.now() - startTime) / 1000
-
-    return NextResponse.json({
-        query,
-        results: results.map((r: any) => ({ ...r, similarity: 0.5 })),
-        aiAnswer: null,
-        timeTaken,
-    })
-}
-
-async function generateAIAnswer(query: string, results: any[]) {
+async function generateAIAnswer(query: string, results: any[]): Promise<string | null> {
     try {
         // Build context from search results
         const context = results
-            .slice(0, 5)
-            .map((r, i) => `[Source ${i + 1}: ${r.case_name || 'Unknown'} (${r.neutral_citation || 'No citation'})]\n${r.chunk_text}`)
-            .join('\n\n')
+            .slice(0, 6)
+            .map((r, i) => {
+                const citation = r.neutral_citation || r.hklii_id || 'No citation'
+                const caseName = r.case_name || 'Unknown case'
+                return `[Source ${i + 1}: ${caseName} (${citation})]\n${r.chunk_text?.slice(0, 800) || ''}`
+            })
+            .join('\n\n---\n\n')
 
-        const systemPrompt = `You are a Hong Kong legal research assistant. You help lawyers and legal professionals find relevant case law.
+        const systemPrompt = `You are a Hong Kong legal research assistant. You help lawyers and legal professionals understand case law.
 
-IMPORTANT RULES:
-1. ONLY use information from the provided sources
-2. ALWAYS cite the source number and case name when making claims
-3. If the sources don't contain enough information, say "The retrieved sources do not contain sufficient information to answer this question."
-4. Be concise but thorough
-5. Never make up information not in the sources`
+CRITICAL RULES:
+1. ONLY use information from the provided case law sources
+2. ALWAYS cite sources using [Source X] format when making claims
+3. If sources don't contain enough information, clearly state: "The retrieved sources do not contain sufficient information to fully answer this question."
+4. Be precise and professional
+5. Never fabricate information or cite non-existent sources
+6. Use proper legal terminology
+7. Format your response clearly with paragraphs`
 
-        const userPrompt = `Based on the following case law excerpts, answer this legal question:
+        const userPrompt = `Based on the following Hong Kong case law excerpts, answer this legal question:
 
-Question: ${query}
+QUESTION: ${query}
 
-Sources:
+CASE LAW SOURCES:
 ${context}
 
-Provide a clear answer with citations to the source numbers.`
+Provide a clear, well-structured answer with citations to the relevant source numbers. If multiple sources are relevant, synthesize the information.`
 
         const response = await fetch(`${IFLOW_API_URL}/chat/completions`, {
             method: 'POST',
@@ -142,18 +160,19 @@ Provide a clear answer with citations to the source numbers.`
                     { role: 'system', content: systemPrompt },
                     { role: 'user', content: userPrompt },
                 ],
-                temperature: 0.3,
-                max_tokens: 1000,
+                temperature: 0.2,
+                max_tokens: 1500,
             }),
         })
 
         if (!response.ok) {
-            console.error('AI response failed')
+            const errorText = await response.text()
+            console.error('AI API error:', response.status, errorText)
             return null
         }
 
         const data = await response.json()
-        return data.choices[0]?.message?.content || null
+        return data.choices?.[0]?.message?.content || null
     } catch (error) {
         console.error('AI generation error:', error)
         return null
