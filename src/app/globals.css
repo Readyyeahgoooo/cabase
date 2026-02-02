@@ -286,6 +286,45 @@ body {
   color: var(--accent);
 }
 
+/* Query Analysis Display */
+.query-analysis {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  padding: 1rem 1.5rem;
+  background: rgba(212, 168, 83, 0.1);
+  border: 1px solid rgba(212, 168, 83, 0.3);
+  border-radius: 12px;
+  margin-bottom: 1.5rem;
+}
+
+.analysis-label {
+  color: var(--accent);
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+
+.concept-tag {
+  padding: 0.35rem 0.85rem;
+  background: var(--primary-light);
+  border-radius: 20px;
+  color: var(--text-primary);
+  font-size: 0.8rem;
+  font-weight: 500;
+}
+
+.query-type-badge {
+  padding: 0.35rem 0.85rem;
+  background: linear-gradient(135deg, var(--accent) 0%, #b7791f 100%);
+  border-radius: 20px;
+  color: var(--bg-dark);
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
 /* Loading */
 .spinner {
   width: 20px;

@@ -20,6 +20,12 @@ interface SearchResponse {
     aiAnswer?: string
     query: string
     timeTaken: number
+    queryAnalysis?: {
+        subQueries: string[]
+        keywords: string[]
+        legalConcepts: string[]
+        queryType: string
+    }
 }
 
 interface SearchHistoryItem {
@@ -188,7 +194,12 @@ export default function Home() {
                 {/* Quick Examples */}
                 <div className="quick-examples">
                     <span className="examples-label">Try:</span>
-                    {['negligence test', 'duty of care', 'contract breach damages', 'judicial review grounds'].map(ex => (
+                    {[
+                        'defendant escapes liability personal injury',
+                        'breach of contract damages measure',
+                        'judicial review procedural fairness',
+                        'negligence duty of care employer'
+                    ].map(ex => (
                         <button
                             key={ex}
                             type="button"
@@ -200,6 +211,19 @@ export default function Home() {
                     ))}
                 </div>
             </form>
+
+            {/* Query Analysis Display */}
+            {response?.queryAnalysis && response.queryAnalysis.legalConcepts.length > 0 && (
+                <div className="query-analysis">
+                    <span className="analysis-label">🔍 Searched for:</span>
+                    {response.queryAnalysis.legalConcepts.map((concept, i) => (
+                        <span key={i} className="concept-tag">{concept}</span>
+                    ))}
+                    {response.queryAnalysis.queryType === 'complex' && (
+                        <span className="query-type-badge">Complex Query</span>
+                    )}
+                </div>
+            )}
 
             {/* Error */}
             {error && (
