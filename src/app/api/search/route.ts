@@ -6,6 +6,9 @@ const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY!
 const IFLOW_API_KEY = process.env.IFLOW_API_KEY!
 const IFLOW_API_URL = process.env.IFLOW_API_URL || 'https://apis.iflow.cn/v1'
 
+// HuggingFace Inference API for bge-small-en-v1.5 (free, 384 dimensions - matches our stored embeddings)
+const HF_EMBEDDING_API = 'https://api-inference.huggingface.co/pipeline/feature-extraction/BAAI/bge-small-en-v1.5'
+
 export async function POST(request: NextRequest) {
     const startTime = Date.now()
 
@@ -16,25 +19,33 @@ export async function POST(request: NextRequest) {
             return NextResponse.json({ error: 'Query is required' }, { status: 400 })
         }
 
-        // Step 1: Generate embedding for the query using iFlow
+        // Step 1: Generate embedding using HuggingFace (same model as stored embeddings)
         let queryEmbedding: number[] | null = null
 
         try {
-            const embeddingResponse = await fetch(`${IFLOW_API_URL}/embeddings`, {
+            // Use HuggingFace Inference API for bge-small-en-v1.5 (384 dimensions)
+            const embeddingResponse = await fetch(HF_EMBEDDING_API, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${IFLOW_API_KEY}`,
                 },
                 body: JSON.stringify({
-                    model: 'text-embedding-3-small',
-                    input: query,
+                    inputs: query,
+                    options: { wait_for_model: true }
                 }),
             })
 
             if (embeddingResponse.ok) {
-                const embeddingData = await embeddingResponse.json()
-                queryEmbedding = embeddingData.data?.[0]?.embedding
+                const embedding = await embeddingResponse.json()
+                // HuggingFace returns the embedding directly as an array
+                if (Array.isArray(embedding) && embedding.length === 384) {
+                    queryEmbedding = embedding
+                } else if (Array.isArray(embedding) && Array.isArray(embedding[0])) {
+                    // Sometimes it returns [[...embedding...]]
+                    queryEmbedding = embedding[0]
+                }
+            } else {
+                console.error('HuggingFace embedding failed:', await embeddingResponse.text())
             }
         } catch (e) {
             console.error('Embedding API error:', e)
@@ -42,7 +53,7 @@ export async function POST(request: NextRequest) {
 
         let results: any[] = []
 
-        if (queryEmbedding) {
+        if (queryEmbedding && queryEmbedding.length === 384) {
             // Step 2a: Use semantic search with embeddings
             const searchBody: any = {
                 query_embedding: queryEmbedding,
@@ -66,30 +77,36 @@ export async function POST(request: NextRequest) {
 
             if (searchResponse.ok) {
                 results = await searchResponse.json()
+            } else {
+                console.error('Supabase search error:', await searchResponse.text())
             }
         }
 
         // Step 2b: Fallback to keyword search if embedding failed or no results
         if (results.length === 0) {
+            console.log('Falling back to keyword search...')
             const keywords = query.split(' ').filter((w: string) => w.length > 3).slice(0, 3)
-            const searchTerms = keywords.map((k: string) => `chunk_text.ilike.*${k}*`).join(',')
 
-            let url = `${SUPABASE_URL}/rest/v1/case_chunks?or=(${searchTerms})&limit=10&select=id,case_id,case_name,neutral_citation,court,decision_date,chunk_text,section_type,hklii_id`
+            if (keywords.length > 0) {
+                const searchTerms = keywords.map((k: string) => `chunk_text.ilike.*${k}*`).join(',')
 
-            if (court && court !== 'all') {
-                url += `&court=eq.${court}`
-            }
+                let url = `${SUPABASE_URL}/rest/v1/case_chunks?or=(${searchTerms})&limit=10&select=id,case_id,case_name,neutral_citation,court,decision_date,chunk_text,section_type,hklii_id`
 
-            const fallbackResponse = await fetch(url, {
-                headers: {
-                    'apikey': SUPABASE_KEY,
-                    'Authorization': `Bearer ${SUPABASE_KEY}`,
-                },
-            })
+                if (court && court !== 'all') {
+                    url += `&court=eq.${court}`
+                }
 
-            if (fallbackResponse.ok) {
-                const fallbackResults = await fallbackResponse.json()
-                results = fallbackResults.map((r: any) => ({ ...r, similarity: 0.5 }))
+                const fallbackResponse = await fetch(url, {
+                    headers: {
+                        'apikey': SUPABASE_KEY,
+                        'Authorization': `Bearer ${SUPABASE_KEY}`,
+                    },
+                })
+
+                if (fallbackResponse.ok) {
+                    const fallbackResults = await fallbackResponse.json()
+                    results = fallbackResults.map((r: any) => ({ ...r, similarity: 0.5 }))
+                }
             }
         }
 
