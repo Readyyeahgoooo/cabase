@@ -275,7 +275,16 @@ export default function Home() {
                                 {result.hklii_id && (
                                     <div className="result-actions">
                                         <a
-                                            href={`https://www.hklii.hk/en/cases/${result.court}/${result.hklii_id.split('/').pop()}`}
+                                            href={(() => {
+                                                // hklii_id format: court_year_num (e.g., hkca_2026_91)
+                                                const parts = result.hklii_id.split('_')
+                                                if (parts.length === 3) {
+                                                    const [court, year, num] = parts
+                                                    return `https://www.hklii.hk/en/cases/${court}/${year}/${num}`
+                                                }
+                                                // Fallback to neutral citation search
+                                                return `https://www.hklii.hk/en/search?q=${encodeURIComponent(result.neutral_citation || result.case_name || '')}`
+                                            })()}
                                             target="_blank"
                                             rel="noopener noreferrer"
                                             className="view-full-button"

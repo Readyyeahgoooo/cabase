@@ -9,6 +9,9 @@ const IFLOW_API_URL = process.env.IFLOW_API_URL || 'https://apis.iflow.cn/v1'
 // HuggingFace Inference API for bge-small-en-v1.5 (free, 384 dimensions - matches our stored embeddings)
 const HF_EMBEDDING_API = 'https://api-inference.huggingface.co/pipeline/feature-extraction/BAAI/bge-small-en-v1.5'
 
+// Minimum similarity threshold - only show relevant results
+const MIN_SIMILARITY = 0.50  // 50% minimum relevance
+
 export async function POST(request: NextRequest) {
     const startTime = Date.now()
 
@@ -54,11 +57,11 @@ export async function POST(request: NextRequest) {
         let results: any[] = []
 
         if (queryEmbedding && queryEmbedding.length === 384) {
-            // Step 2a: Use semantic search with embeddings
+            // Step 2a: Use semantic search with embeddings - higher threshold for relevance
             const searchBody: any = {
                 query_embedding: queryEmbedding,
-                match_threshold: 0.35,
-                match_count: 10,
+                match_threshold: MIN_SIMILARITY,  // Higher threshold for relevant results
+                match_count: 15,  // Get more so we can filter
             }
 
             if (court && court !== 'all') {
@@ -76,15 +79,19 @@ export async function POST(request: NextRequest) {
             })
 
             if (searchResponse.ok) {
-                results = await searchResponse.json()
+                const rawResults = await searchResponse.json()
+                // Filter to only include results above minimum similarity
+                results = rawResults.filter((r: any) => r.similarity >= MIN_SIMILARITY)
+                // Take top 10 most relevant
+                results = results.slice(0, 10)
             } else {
                 console.error('Supabase search error:', await searchResponse.text())
             }
         }
 
-        // Step 2b: Fallback to keyword search if embedding failed or no results
-        if (results.length === 0) {
-            console.log('Falling back to keyword search...')
+        // Step 2b: Fallback to keyword search only if semantic failed completely
+        if (results.length === 0 && !queryEmbedding) {
+            console.log('Falling back to keyword search (embedding failed)...')
             const keywords = query.split(' ').filter((w: string) => w.length > 3).slice(0, 3)
 
             if (keywords.length > 0) {
@@ -114,6 +121,9 @@ export async function POST(request: NextRequest) {
         let aiAnswer: string | null = null
         if (results.length > 0) {
             aiAnswer = await generateAIAnswer(query, results)
+        } else {
+            // No relevant results found
+            aiAnswer = `No relevant Hong Kong case law found for your query: "${query}"\n\nTry rephrasing your question or using more specific legal terms like "negligence", "breach of contract", "judicial review", etc.`
         }
 
         const timeTaken = (Date.now() - startTime) / 1000
@@ -141,7 +151,8 @@ async function generateAIAnswer(query: string, results: any[]): Promise<string |
             .map((r, i) => {
                 const citation = r.neutral_citation || r.hklii_id || 'No citation'
                 const caseName = r.case_name || 'Unknown case'
-                return `[Source ${i + 1}: ${caseName} (${citation})]\n${r.chunk_text?.slice(0, 800) || ''}`
+                const similarity = r.similarity ? `(${(r.similarity * 100).toFixed(0)}% match)` : ''
+                return `[Source ${i + 1}: ${caseName} ${citation} ${similarity}]\n${r.chunk_text?.slice(0, 800) || ''}`
             })
             .join('\n\n---\n\n')
 
