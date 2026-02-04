@@ -1,9 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server'
 
+// Force dynamic rendering (fixes the static generation error)
+export const dynamic = 'force-dynamic'
+
 const SUPABASE_URL = process.env.SUPABASE_URL!
 const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY!
 const IFLOW_API_KEY = process.env.IFLOW_API_KEY!
 const IFLOW_API_URL = process.env.IFLOW_API_URL || 'https://apis.iflow.cn/v1'
+
+// Qdrant Cloud configuration
+const QDRANT_URL = process.env.QDRANT_URL!
+const QDRANT_API_KEY = process.env.QDRANT_API_KEY!
+const QDRANT_COLLECTION = 'legal_chunks'
 
 const HF_EMBEDDING_API = 'https://api-inference.huggingface.co/pipeline/feature-extraction/BAAI/bge-small-en-v1.5'
 
@@ -41,9 +49,10 @@ export async function POST(request: NextRequest) {
         let allResults: SearchResult[] = []
 
         // =========================================================================
-        // STEP 1: Semantic search
+        // STEP 1: Semantic search via Qdrant Cloud
         // =========================================================================
         try {
+            // Generate embedding
             const embeddingResponse = await fetch(HF_EMBEDDING_API, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -57,23 +66,49 @@ export async function POST(request: NextRequest) {
                     : (Array.isArray(embedding[0]) ? embedding[0] : null)
 
                 if (queryEmbedding) {
-                    const searchResponse = await fetch(`${SUPABASE_URL}/rest/v1/rpc/match_legal_chunks`, {
+                    // Build Qdrant filter if court is specified
+                    const filter = court ? {
+                        must: [{
+                            key: "court",
+                            match: { value: court.toLowerCase() }
+                        }]
+                    } : undefined
+
+                    // Search Qdrant Cloud
+                    const qdrantResponse = await fetch(`${QDRANT_URL}/collections/${QDRANT_COLLECTION}/points/query`, {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json',
-                            'apikey': SUPABASE_KEY,
-                            'Authorization': `Bearer ${SUPABASE_KEY}`,
+                            'api-key': QDRANT_API_KEY,
                         },
                         body: JSON.stringify({
-                            query_embedding: queryEmbedding,
-                            match_threshold: 0.25,
-                            match_count: 25,
+                            query: queryEmbedding,
+                            limit: 25,
+                            score_threshold: 0.25,
+                            with_payload: true,
+                            filter: filter,
                         }),
                     })
 
-                    if (searchResponse.ok) {
-                        const results = await searchResponse.json()
-                        allResults.push(...results.map((r: any) => ({ ...r, source: 'semantic' })))
+                    if (qdrantResponse.ok) {
+                        const qdrantData = await qdrantResponse.json()
+                        const results = qdrantData.result?.points || []
+
+                        allResults.push(...results.map((r: any) => ({
+                            id: r.id,
+                            case_id: r.payload?.case_id,
+                            case_name: r.payload?.case_name || '',
+                            neutral_citation: r.payload?.neutral_citation || '',
+                            court: r.payload?.court || '',
+                            decision_date: r.payload?.decision_date || '',
+                            chunk_text: r.payload?.chunk_text || '',
+                            section_type: r.payload?.section_type || '',
+                            hklii_id: r.payload?.hklii_id || '',
+                            similarity: r.score || 0,
+                            source: 'semantic'
+                        })))
+                    } else {
+                        console.error('Qdrant search failed:', await qdrantResponse.text())
                     }
                 }
             }
